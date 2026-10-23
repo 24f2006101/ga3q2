@@ -1,11 +1,21 @@
+from __future__ import annotations
+
+import hashlib
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+)
 from fastapi.responses import JSONResponse
 from openai import OpenAI
 
@@ -22,15 +32,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-USE_LLM = os.getenv(
-    "USE_LLM",
-    "false",
-).lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+USE_LLM = (
+    os.getenv("USE_LLM", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
 
 OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY",
@@ -45,6 +50,15 @@ BASE_URL = os.getenv(
     "BASE_URL",
     "https://ga3q2-a7fm.onrender.com",
 ).rstrip("/")
+
+STATE_FILE = os.getenv(
+    "STATE_FILE",
+    "/tmp/invoice_action_agent_state.json",
+)
+
+A2A_MEDIA_TYPE = "application/a2a+json"
+
+SUPPORTED_A2A_VERSION = "1.0"
 
 BATCH_MEDIA_TYPE = (
     "application/vnd.ga5.invoice-claim-batch+json"
@@ -66,7 +80,21 @@ ALLOWED_ACTIONS = {
     "open_exception",
 }
 
-TASKS: dict[str, dict[str, Any]] = {}
+TASK_STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
+TASK_STATE_WORKING = "TASK_STATE_WORKING"
+TASK_STATE_INPUT_REQUIRED = "TASK_STATE_INPUT_REQUIRED"
+TASK_STATE_COMPLETED = "TASK_STATE_COMPLETED"
+TASK_STATE_CANCELED = "TASK_STATE_CANCELED"
+TASK_STATE_FAILED = "TASK_STATE_FAILED"
+
+STATE_LOCK = threading.RLock()
+
+STATE: dict[str, Any] = {
+    "tasks": {},
+    "messages": {},
+    "receipts": {},
+}
+
 
 OPENAI_CLIENT: OpenAI | None = None
 
@@ -74,6 +102,72 @@ if USE_LLM and OPENAI_API_KEY:
     OPENAI_CLIENT = OpenAI(
         api_key=OPENAI_API_KEY,
     )
+
+
+# ============================================================
+# Persistent state
+# ============================================================
+
+def load_state() -> None:
+    global STATE
+
+    try:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            loaded = json.load(file)
+
+        if isinstance(loaded, dict):
+            STATE = loaded
+
+        STATE.setdefault("tasks", {})
+        STATE.setdefault("messages", {})
+        STATE.setdefault("receipts", {})
+
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        OSError,
+    ):
+        STATE = {
+            "tasks": {},
+            "messages": {},
+            "receipts": {},
+        }
+
+
+def save_state() -> None:
+    directory = os.path.dirname(STATE_FILE)
+
+    if directory:
+        os.makedirs(
+            directory,
+            exist_ok=True,
+        )
+
+    temporary_file = f"{STATE_FILE}.tmp"
+
+    with open(
+        temporary_file,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            STATE,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(
+        temporary_file,
+        STATE_FILE,
+    )
+
+
+load_state()
 
 
 # ============================================================
@@ -86,14 +180,41 @@ def now_iso() -> str:
     ).isoformat()
 
 
-def json_response(
+def canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+def value_hash(value: Any) -> str:
+    return sha256_text(
+        canonical_json(value)
+    )
+
+
+def principal_hash(token: str) -> str:
+    return sha256_text(token)
+
+
+def a2a_response(
     content: dict[str, Any],
     status_code: int = 200,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         content=content,
         status_code=status_code,
-        media_type="application/a2a+json",
+        headers=headers,
+        media_type=A2A_MEDIA_TYPE,
     )
 
 
@@ -101,7 +222,7 @@ def rpc_success(
     request_id: Any,
     result: dict[str, Any],
 ) -> JSONResponse:
-    return json_response(
+    return a2a_response(
         {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -116,7 +237,7 @@ def rpc_error(
     message: str,
     status_code: int,
 ) -> JSONResponse:
-    return json_response(
+    return a2a_response(
         {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -129,14 +250,192 @@ def rpc_error(
     )
 
 
+# ============================================================
+# Authentication and protocol
+# ============================================================
+
+def require_bearer_token(
+    authorization: str | None = Header(
+        default=None,
+    ),
+) -> str:
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Bearer token",
+            headers={
+                "WWW-Authenticate": "Bearer",
+            },
+        )
+
+    scheme, separator, token = authorization.partition(
+        " "
+    )
+
+    if scheme.lower() != "bearer" or not separator:
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer authentication required",
+            headers={
+                "WWW-Authenticate": "Bearer",
+            },
+        )
+
+    token = token.strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer token cannot be empty",
+            headers={
+                "WWW-Authenticate": "Bearer",
+            },
+        )
+
+    return token
+
+
+def validate_a2a_request(
+    request: Request,
+) -> None:
+    version = request.headers.get(
+        "A2A-Version"
+    )
+
+    if version != SUPPORTED_A2A_VERSION:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported A2A-Version; "
+                "expected 1.0"
+            ),
+        )
+
+    content_type = request.headers.get(
+        "Content-Type"
+    )
+
+    if not content_type:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Content-Type must be "
+                "application/a2a+json"
+            ),
+        )
+
+    media_type = content_type.split(
+        ";",
+        maxsplit=1,
+    )[0].strip().lower()
+
+    if media_type != A2A_MEDIA_TYPE:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Content-Type must be "
+                "application/a2a+json"
+            ),
+        )
+
+
+# ============================================================
+# Agent Card
+# ============================================================
+
+def agent_card_data() -> dict[str, Any]:
+    return {
+        "protocolVersion": "1.0",
+        "name": "Invoice Action Agent",
+        "description": (
+            "Evaluates invoice claim batches and creates "
+            "evidence-based action proposals."
+        ),
+        "version": "1.0.0",
+        "url": BASE_URL,
+        "preferredTransport": "JSONRPC",
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": True,
+            "extendedAgentCard": False,
+        },
+        "defaultInputModes": [
+            A2A_MEDIA_TYPE,
+            BATCH_MEDIA_TYPE,
+        ],
+        "defaultOutputModes": [
+            A2A_MEDIA_TYPE,
+            PROPOSAL_MEDIA_TYPE,
+            RECEIPT_MEDIA_TYPE,
+        ],
+        "securitySchemes": {
+            "bearerAuth": {
+                "httpAuthSecurityScheme": {
+                    "scheme": "bearer",
+                    "bearerFormat": "Bearer",
+                }
+            }
+        },
+        "securityRequirements": [
+            {
+                "schemes": {
+                    "bearerAuth": {
+                        "list": [],
+                    }
+                }
+            }
+        ],
+        "skills": [
+            {
+                "id": "invoice_action_agent",
+                "name": "Invoice action agent",
+                "description": (
+                    "Processes invoice batches, proposes "
+                    "safe actions, and produces receipts."
+                ),
+                "tags": [
+                    "invoice",
+                    "payments",
+                    "approval",
+                    "receipts",
+                ],
+                "examples": [
+                    "Evaluate an invoice batch.",
+                    "Create receipts for accepted actions.",
+                ],
+                "inputModes": [
+                    A2A_MEDIA_TYPE,
+                    BATCH_MEDIA_TYPE,
+                ],
+                "outputModes": [
+                    A2A_MEDIA_TYPE,
+                    PROPOSAL_MEDIA_TYPE,
+                    RECEIPT_MEDIA_TYPE,
+                ],
+            }
+        ],
+    }
+
+
+@app.get("/.well-known/agent-card.json")
+def get_agent_card() -> dict[str, Any]:
+    return agent_card_data()
+
+
+@app.get("/.well-known/agent.json")
+def get_legacy_agent_card() -> dict[str, Any]:
+    return agent_card_data()
+
+
+# ============================================================
+# Business logic
+# ============================================================
+
 def package_text(
     package: dict[str, Any],
 ) -> str:
-    return json.dumps(
-        package,
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+    return canonical_json(package)
 
 
 def find_evidence_refs(
@@ -144,7 +443,7 @@ def find_evidence_refs(
 ) -> list[str]:
     text = package_text(package)
 
-    common_refs = [
+    known_refs = [
         "[invoice-1]",
         "[reconciliation-1]",
         "[authority-1]",
@@ -156,20 +455,20 @@ def find_evidence_refs(
 
     found = [
         reference
-        for reference in common_refs
+        for reference in known_refs
         if reference in text
     ]
-
-    if len(found) >= 3:
-        return found[:3]
 
     dynamic_refs: list[str] = []
 
     def walk(value: Any) -> None:
         if isinstance(value, str):
-            if value.startswith("[") and value.endswith("]"):
-                if value not in dynamic_refs:
-                    dynamic_refs.append(value)
+            if (
+                value.startswith("[")
+                and value.endswith("]")
+                and value not in dynamic_refs
+            ):
+                dynamic_refs.append(value)
 
         elif isinstance(value, dict):
             for child in value.values():
@@ -229,38 +528,37 @@ def choose_action(
     return "hold_invoice"
 
 
-# ============================================================
-# Non-LLM decision mode
-# ============================================================
-
 def non_llm_proposal(
     package: dict[str, Any],
 ) -> dict[str, Any]:
-    package_id = package.get(
-        "packageId",
+    package_id = str(
         package.get(
-            "package_id",
-            str(uuid.uuid4()),
-        ),
+            "packageId",
+            package.get(
+                "package_id",
+                str(uuid.uuid4()),
+            ),
+        )
     )
 
-    action = choose_action(package)
-    evidence_refs = find_evidence_refs(package)
-
-    vendor_name = package.get(
-        "vendorName",
+    vendor_name = str(
         package.get(
-            "vendor",
-            "Unknown vendor",
-        ),
+            "vendorName",
+            package.get(
+                "vendor",
+                "Unknown vendor",
+            ),
+        )
     )
 
-    invoice_number = package.get(
-        "invoiceNumber",
+    invoice_number = str(
         package.get(
-            "invoice_number",
-            "Unknown invoice",
-        ),
+            "invoiceNumber",
+            package.get(
+                "invoice_number",
+                "Unknown invoice",
+            ),
+        )
     )
 
     amount_minor = package.get(
@@ -271,74 +569,60 @@ def non_llm_proposal(
         ),
     )
 
-    currency = package.get(
-        "currency",
-        "INR",
+    try:
+        amount_minor = int(amount_minor)
+
+    except (TypeError, ValueError):
+        amount_minor = 0
+
+    currency = str(
+        package.get(
+            "currency",
+            "INR",
+        )
     )
 
-    rationale = (
-        f"{action}: the invoice package was evaluated using "
-        "the local rule-based decision engine. The decision uses "
-        f"the supplied evidence references "
-        f"{evidence_refs[0]}, {evidence_refs[1]}, and "
-        f"{evidence_refs[2]}."
-    )
+    action = choose_action(package)
+    evidence_refs = find_evidence_refs(package)
 
     return {
-        "packageId": str(package_id),
+        "packageId": package_id,
         "actionId": str(uuid.uuid4()),
         "action": action,
         "facts": {
-            "vendorName": str(vendor_name),
-            "invoiceNumber": str(invoice_number),
-            "amountMinor": int(amount_minor),
-            "currency": str(currency),
+            "vendorName": vendor_name,
+            "invoiceNumber": invoice_number,
+            "amountMinor": amount_minor,
+            "currency": currency,
         },
         "evidenceRefs": evidence_refs,
-        "rationale": rationale,
+        "rationale": (
+            f"{action}: the invoice package was evaluated "
+            "using the supplied evidence references "
+            f"{evidence_refs[0]}, "
+            f"{evidence_refs[1]}, and "
+            f"{evidence_refs[2]}."
+        ),
     }
 
-
-# ============================================================
-# LLM decision mode
-# ============================================================
 
 def llm_proposal(
     package: dict[str, Any],
 ) -> dict[str, Any]:
+    fallback = non_llm_proposal(package)
+
     if OPENAI_CLIENT is None:
-        return non_llm_proposal(package)
+        return fallback
 
-    package_id = package.get(
-        "packageId",
-        str(uuid.uuid4()),
+    prompt = (
+        "Analyze this invoice package. Return valid JSON only "
+        "with packageId, actionId, action, facts, evidenceRefs, "
+        "and rationale. Choose exactly one action from: "
+        "settle_invoice, request_approval, hold_invoice, "
+        "reject_duplicate, open_exception. Use only supplied "
+        "evidence and exactly three evidence references.\n\n"
+        f"{package_text(package)}"
     )
-
-    prompt = f"""
-Analyze this invoice package and return one JSON object.
-
-Only use evidence in the package.
-Choose exactly one action from:
-settle_invoice, request_approval, hold_invoice,
-reject_duplicate, open_exception.
-
-Return these fields:
-packageId
-actionId
-action
-facts
-evidenceRefs
-rationale
-
-The packageId must be:
-{package_id}
-
-The evidenceRefs list must contain exactly three strings
-copied from the invoice package.
-
-Invoice package:
-{package_text(package)}
-"""
 
     try:
         response = OPENAI_CLIENT.chat.completions.create(
@@ -351,8 +635,8 @@ Invoice package:
                 {
                     "role": "system",
                     "content": (
-                        "You are a careful invoice decision engine. "
-                        "Return valid JSON only."
+                        "You are a strict invoice "
+                        "decision engine."
                     ),
                 },
                 {
@@ -365,32 +649,34 @@ Invoice package:
         content = response.choices[0].message.content
 
         if not content:
-            return non_llm_proposal(package)
+            return fallback
 
         proposal = json.loads(content)
 
         if not isinstance(proposal, dict):
-            return non_llm_proposal(package)
-
-        proposal["packageId"] = str(package_id)
-        proposal["actionId"] = str(uuid.uuid4())
+            return fallback
 
         if proposal.get("action") not in ALLOWED_ACTIONS:
-            return non_llm_proposal(package)
+            return fallback
 
         if not isinstance(
             proposal.get("evidenceRefs"),
             list,
         ):
-            return non_llm_proposal(package)
+            return fallback
 
         if len(proposal["evidenceRefs"]) != 3:
-            return non_llm_proposal(package)
+            return fallback
+
+        proposal["packageId"] = fallback[
+            "packageId"
+        ]
+        proposal["actionId"] = str(uuid.uuid4())
 
         return proposal
 
     except Exception:
-        return non_llm_proposal(package)
+        return fallback
 
 
 def make_proposal(
@@ -403,7 +689,7 @@ def make_proposal(
 
 
 # ============================================================
-# Input extraction
+# Input parsing
 # ============================================================
 
 def extract_batch_from_message(
@@ -424,14 +710,22 @@ def extract_batch_from_message(
         data = part.get("data")
 
         if isinstance(data, dict):
-            if "packages" in data:
+            if isinstance(
+                data.get("packages"),
+                list,
+            ):
                 return data
 
-            if "batch" in data:
-                batch = data["batch"]
+            nested_batch = data.get(
+                "batch"
+            )
 
-                if isinstance(batch, dict):
-                    return batch
+            if isinstance(nested_batch, dict):
+                if isinstance(
+                    nested_batch.get("packages"),
+                    list,
+                ):
+                    return nested_batch
 
         text = part.get("text")
 
@@ -445,165 +739,328 @@ def extract_batch_from_message(
             if not isinstance(parsed, dict):
                 continue
 
-            if "packages" in parsed:
+            if isinstance(
+                parsed.get("packages"),
+                list,
+            ):
                 return parsed
 
-            if isinstance(
-                parsed.get("batch"),
-                dict,
-            ):
-                return parsed["batch"]
+            nested_batch = parsed.get(
+                "batch"
+            )
+
+            if isinstance(nested_batch, dict):
+                if isinstance(
+                    nested_batch.get("packages"),
+                    list,
+                ):
+                    return nested_batch
 
     return None
 
 
-def extract_message(
+def extract_rpc_message(
     payload: dict[str, Any],
 ) -> tuple[Any, dict[str, Any] | None]:
     request_id = payload.get("id")
 
-    if isinstance(
-        payload.get("params"),
-        dict,
-    ):
-        return (
-            request_id,
-            payload["params"].get("message"),
-        )
+    if payload.get("jsonrpc") != "2.0":
+        return request_id, None
+
+    if payload.get("method") != "message/send":
+        return request_id, None
+
+    params = payload.get("params")
+
+    if not isinstance(params, dict):
+        return request_id, None
+
+    message = params.get("message")
+
+    if not isinstance(message, dict):
+        return request_id, None
+
+    return request_id, message
+
+
+# ============================================================
+# Task helpers
+# ============================================================
+
+def task_for_principal(
+    token: str,
+    task_id: str,
+) -> dict[str, Any] | None:
+    owner = principal_hash(token)
 
     return (
-        request_id,
-        payload.get("message"),
+        STATE
+        .get("tasks", {})
+        .get(owner, {})
+        .get(task_id)
+    )
+
+
+def save_task(
+    token: str,
+    task: dict[str, Any],
+) -> None:
+    owner = principal_hash(token)
+
+    STATE.setdefault(
+        "tasks",
+        {},
+    )
+
+    STATE["tasks"].setdefault(
+        owner,
+        {},
+    )
+
+    STATE["tasks"][owner][
+        task["id"]
+    ] = task
+
+
+def update_task(
+    token: str,
+    task: dict[str, Any],
+) -> None:
+    save_task(
+        token=token,
+        task=task,
     )
 
 
 # ============================================================
-# Task creation
+# Message processing
 # ============================================================
 
-def create_invoice_task(
-    message: dict[str, Any],
-    batch: dict[str, Any],
-) -> dict[str, Any]:
-    task_id = str(uuid.uuid4())
+async def process_message(
+    request: Request,
+    token: str,
+) -> JSONResponse:
+    validate_a2a_request(request)
 
-    batch_id = batch.get(
-        "batchId",
-        str(uuid.uuid4()),
+    try:
+        payload = await request.json()
+
+    except Exception:
+        return rpc_error(
+            request_id=None,
+            code=-32700,
+            message="Invalid JSON",
+            status_code=400,
+        )
+
+    if not isinstance(payload, dict):
+        return rpc_error(
+            request_id=None,
+            code=-32600,
+            message="Invalid Request",
+            status_code=400,
+        )
+
+    request_id = payload.get("id")
+
+    if payload.get("jsonrpc") != "2.0":
+        return rpc_error(
+            request_id=request_id,
+            code=-32600,
+            message="jsonrpc must be 2.0",
+            status_code=400,
+        )
+
+    if payload.get("method") != "message/send":
+        return rpc_error(
+            request_id=request_id,
+            code=-32601,
+            message="method must be message/send",
+            status_code=400,
+        )
+
+    request_id, message = extract_rpc_message(
+        payload
     )
+
+    if message is None:
+        return rpc_error(
+            request_id=request_id,
+            code=-32602,
+            message="params.message is required",
+            status_code=400,
+        )
+
+    role = message.get("role")
+
+    if role not in {
+        "ROLE_USER",
+        "user",
+    }:
+        return rpc_error(
+            request_id=request_id,
+            code=-32602,
+            message="message.role must be ROLE_USER",
+            status_code=400,
+        )
+
+    message["role"] = "ROLE_USER"
+
+    message_id = message.get(
+        "messageId"
+    )
+
+    if not isinstance(message_id, str):
+        return rpc_error(
+            request_id=request_id,
+            code=-32602,
+            message="messageId is required",
+            status_code=400,
+        )
+
+    batch = extract_batch_from_message(
+        message
+    )
+
+    if batch is None:
+        return rpc_error(
+            request_id=request_id,
+            code=-32602,
+            message="Invoice batch data is required",
+            status_code=400,
+        )
 
     packages = batch.get(
-        "packages",
-        [],
+        "packages"
     )
 
     if not isinstance(packages, list):
-        packages = []
-
-    proposals = []
-
-    for package in packages:
-        if not isinstance(package, dict):
-            continue
-
-        proposals.append(
-            make_proposal(package)
+        return rpc_error(
+            request_id=request_id,
+            code=-32602,
+            message="batch.packages must be a list",
+            status_code=400,
         )
 
-    task = {
-        "id": task_id,
-        "contextId": message.get(
-            "contextId",
-            str(uuid.uuid4()),
-        ),
-        "status": {
-            "state": "TASK_STATE_INPUT_REQUIRED",
-            "timestamp": now_iso(),
-        },
-        "history": [
-            message,
-        ],
-        "artifacts": [
-            {
-                "artifactId": str(uuid.uuid4()),
-                "name": "invoice-action-proposals",
-                "parts": [
-                    {
-                        "mediaType": PROPOSAL_MEDIA_TYPE,
-                        "data": {
-                            "batchId": batch_id,
-                            "proposals": proposals,
-                        },
-                    }
-                ],
-            }
-        ],
-    }
+    owner = principal_hash(token)
+    message_key = f"{owner}:{message_id}"
+    message_hash = value_hash(message)
 
-    TASKS[task_id] = task
+    with STATE_LOCK:
+        previous = (
+            STATE
+            .setdefault("messages", {})
+            .get(message_key)
+        )
 
-    return task
+        if previous is not None:
+            if previous.get(
+                "messageHash"
+            ) != message_hash:
+                return rpc_error(
+                    request_id=request_id,
+                    code=-32009,
+                    message="IDEMPOTENCY_CONFLICT",
+                    status_code=409,
+                )
+
+            old_task = task_for_principal(
+                token=token,
+                task_id=previous["taskId"],
+            )
+
+            if old_task is not None:
+                return rpc_success(
+                    request_id=request_id,
+                    result={
+                        "task": old_task,
+                    },
+                )
+
+        proposals: list[
+            dict[str, Any]
+        ] = []
+
+        for package in packages:
+            if not isinstance(package, dict):
+                return rpc_error(
+                    request_id=request_id,
+                    code=-32602,
+                    message=(
+                        "Every package must be an object"
+                    ),
+                    status_code=400,
+                )
+
+            proposals.append(
+                make_proposal(package)
+            )
+
+        task_id = str(uuid.uuid4())
+
+        task = {
+            "id": task_id,
+            "contextId": message.get(
+                "contextId",
+                str(uuid.uuid4()),
+            ),
+            "status": {
+                "state": TASK_STATE_INPUT_REQUIRED,
+                "timestamp": now_iso(),
+            },
+            "history": [
+                message,
+            ],
+            "artifacts": [
+                {
+                    "artifactId": str(uuid.uuid4()),
+                    "name": "invoice-action-proposals",
+                    "parts": [
+                        {
+                            "mediaType": PROPOSAL_MEDIA_TYPE,
+                            "data": {
+                                "batchId": batch.get(
+                                    "batchId",
+                                    str(uuid.uuid4()),
+                                ),
+                                "proposals": proposals,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+        save_task(
+            token=token,
+            task=task,
+        )
+
+        STATE.setdefault(
+            "messages",
+            {},
+        )
+
+        STATE["messages"][
+            message_key
+        ] = {
+            "taskId": task_id,
+            "messageHash": message_hash,
+            "createdAt": now_iso(),
+        }
+
+        save_state()
+
+        return rpc_success(
+            request_id=request_id,
+            result={
+                "task": task,
+            },
+        )
 
 
 # ============================================================
-# Agent Card
-# ============================================================
-
-def agent_card_data() -> dict[str, Any]:
-    return {
-        "name": "Invoice Action Agent",
-        "description": (
-            "Evaluates invoice claim batches and creates "
-            "evidence-based action proposals."
-        ),
-        "version": "1.0.0",
-        "url": BASE_URL,
-        "capabilities": {
-            "streaming": False,
-            "pushNotifications": False,
-        },
-        "authentication": {
-            "schemes": [],
-        },
-        "defaultInputModes": [
-            "application/a2a+json",
-            BATCH_MEDIA_TYPE,
-        ],
-        "defaultOutputModes": [
-            "application/a2a+json",
-            PROPOSAL_MEDIA_TYPE,
-            RECEIPT_MEDIA_TYPE,
-        ],
-        "skills": [
-            {
-                "id": "invoice_action_agent",
-                "name": "Invoice action agent",
-                "description": (
-                    "Processes invoices and proposes "
-                    "safe next actions."
-                ),
-                "tags": [
-                    "invoice",
-                    "payments",
-                    "approval",
-                ],
-            }
-        ],
-    }
-
-
-@app.get("/.well-known/agent-card.json")
-def get_agent_card() -> dict[str, Any]:
-    return agent_card_data()
-
-
-@app.get("/.well-known/agent.json")
-def get_legacy_agent_card() -> dict[str, Any]:
-    return agent_card_data()
-
-
-# ============================================================
-# Health and task endpoints
+# Health and discovery
 # ============================================================
 
 @app.get("/")
@@ -614,164 +1071,538 @@ def health() -> dict[str, str]:
     }
 
 
+# ============================================================
+# Task endpoints
+# ============================================================
+
 @app.get("/tasks")
-def list_tasks() -> dict[str, Any]:
-    return {
-        "tasks": list(TASKS.values()),
-    }
+def list_tasks(
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    owner = principal_hash(token)
+
+    with STATE_LOCK:
+        tasks = list(
+            STATE
+            .get("tasks", {})
+            .get(owner, {})
+            .values()
+        )
+
+    return a2a_response(
+        {
+            "tasks": tasks,
+        }
+    )
 
 
 @app.get("/a2a/tasks")
-def list_a2a_tasks() -> dict[str, Any]:
-    return {
-        "tasks": list(TASKS.values()),
-    }
+def list_a2a_tasks(
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    return list_tasks(
+        token=token,
+    )
 
 
 @app.get("/tasks/{task_id}")
 def get_task(
     task_id: str,
+    token: str = Depends(
+        require_bearer_token
+    ),
 ) -> JSONResponse:
-    task = TASKS.get(task_id)
+    with STATE_LOCK:
+        task = task_for_principal(
+            token=token,
+            task_id=task_id,
+        )
 
     if task is None:
-        return json_response(
+        return a2a_response(
             {
                 "error": "Task not found",
             },
             status_code=404,
         )
 
-    return json_response(task)
+    return a2a_response(task)
 
 
 @app.get("/a2a/tasks/{task_id}")
 def get_a2a_task(
     task_id: str,
+    token: str = Depends(
+        require_bearer_token
+    ),
 ) -> JSONResponse:
-    task = TASKS.get(task_id)
+    return get_task(
+        task_id=task_id,
+        token=token,
+    )
 
-    if task is None:
-        return json_response(
-            {
-                "error": "Task not found",
-            },
-            status_code=404,
+
+# ============================================================
+# Cancellation
+# ============================================================
+
+@app.post("/tasks/{task_id}:cancel")
+def cancel_task(
+    task_id: str,
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    with STATE_LOCK:
+        task = task_for_principal(
+            token=token,
+            task_id=task_id,
         )
 
-    return json_response(task)
+        if task is None:
+            return a2a_response(
+                {
+                    "error": "Task not found",
+                },
+                status_code=404,
+            )
+
+        current_state = task[
+            "status"
+        ]["state"]
+
+        if current_state in {
+            TASK_STATE_COMPLETED,
+            TASK_STATE_CANCELED,
+        }:
+            return a2a_response(
+                {
+                    "error": (
+                        "Task is already terminal"
+                    ),
+                },
+                status_code=409,
+            )
+
+        task["status"] = {
+            "state": TASK_STATE_CANCELED,
+            "timestamp": now_iso(),
+        }
+
+        update_task(
+            token=token,
+            task=task,
+        )
+
+        save_state()
+
+        return a2a_response(task)
 
 
-# ============================================================
-# Message endpoint
-# ============================================================
-
-async def process_message(
-    request: Request,
+@app.post("/a2a/tasks/{task_id}:cancel")
+def cancel_a2a_task(
+    task_id: str,
+    token: str = Depends(
+        require_bearer_token
+    ),
 ) -> JSONResponse:
+    return cancel_task(
+        task_id=task_id,
+        token=token,
+    )
+
+
+# ============================================================
+# Continuation
+# ============================================================
+
+@app.post("/tasks/{task_id}/continue")
+async def continue_task(
+    task_id: str,
+    request: Request,
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    validate_a2a_request(request)
+
     try:
         payload = await request.json()
 
-    except Exception as error:
+    except Exception:
         return rpc_error(
             request_id=None,
             code=-32700,
-            message=f"Invalid JSON: {error}",
+            message="Invalid JSON",
             status_code=400,
         )
 
-    if not isinstance(payload, dict):
-        return rpc_error(
-            request_id=None,
-            code=-32600,
-            message="Request must be a JSON object",
-            status_code=400,
+    request_id = payload.get("id")
+
+    with STATE_LOCK:
+        task = task_for_principal(
+            token=token,
+            task_id=task_id,
         )
 
-    request_id, message = extract_message(payload)
+        if task is None:
+            return rpc_error(
+                request_id=request_id,
+                code=-32004,
+                message="Task not found",
+                status_code=404,
+            )
 
-    if not isinstance(message, dict):
-        return rpc_error(
-            request_id=request_id,
-            code=-32602,
-            message="Missing params.message",
-            status_code=400,
+        current_state = task[
+            "status"
+        ]["state"]
+
+        if current_state == TASK_STATE_CANCELED:
+            return rpc_error(
+                request_id=request_id,
+                code=-32010,
+                message="Task is canceled",
+                status_code=409,
+            )
+
+        if current_state == TASK_STATE_COMPLETED:
+            return rpc_error(
+                request_id=request_id,
+                code=-32011,
+                message="Task is already completed",
+                status_code=409,
+            )
+
+        _, message = extract_rpc_message(
+            payload
         )
 
-    if message.get("role") is None:
-        message["role"] = "ROLE_USER"
+        if message is None:
+            return rpc_error(
+                request_id=request_id,
+                code=-32602,
+                message="params.message is required",
+                status_code=400,
+            )
 
-    if message.get("role") == "user":
-        message["role"] = "ROLE_USER"
+        result_data = None
 
-    if not message.get("messageId"):
-        message["messageId"] = str(uuid.uuid4())
+        params = payload.get(
+            "params"
+        )
 
-    batch = extract_batch_from_message(message)
+        if isinstance(params, dict):
+            candidate = params.get(
+                "result"
+            )
 
-    if batch is None:
-        batch = {
-            "batchId": str(uuid.uuid4()),
-            "packages": [
-                {
-                    "packageId": str(uuid.uuid4()),
-                    "vendorName": "Unknown vendor",
-                    "invoiceNumber": "Unknown invoice",
-                    "amountMinor": 0,
-                    "currency": "INR",
-                    "evidence": [
-                        "[invoice-1]",
-                        "[reconciliation-1]",
-                        "[authority-1]",
-                    ],
-                }
-            ],
+            if isinstance(candidate, dict):
+                result_data = candidate
+
+        if result_data is None:
+            result_data = extract_batch_from_message(
+                message
+            )
+
+        if not isinstance(result_data, dict):
+            return rpc_error(
+                request_id=request_id,
+                code=-32602,
+                message="Execution result is required",
+                status_code=400,
+            )
+
+        executions = result_data.get(
+            "executions"
+        )
+
+        if not isinstance(executions, list):
+            return rpc_error(
+                request_id=request_id,
+                code=-32602,
+                message="executions must be a list",
+                status_code=400,
+            )
+
+        proposal_artifact = None
+
+        for artifact in task.get(
+            "artifacts",
+            [],
+        ):
+            if (
+                artifact.get("name")
+                == "invoice-action-proposals"
+            ):
+                proposal_artifact = artifact
+                break
+
+        if proposal_artifact is None:
+            return rpc_error(
+                request_id=request_id,
+                code=-32012,
+                message="Proposal artifact not found",
+                status_code=409,
+            )
+
+        proposal_data = (
+            proposal_artifact
+            .get("parts", [{}])[0]
+            .get("data", {})
+        )
+
+        proposals = proposal_data.get(
+            "proposals",
+            [],
+        )
+
+        proposal_map = {
+            (
+                proposal.get("packageId"),
+                proposal.get("actionId"),
+                proposal.get("action"),
+            ): proposal
+            for proposal in proposals
+            if isinstance(proposal, dict)
         }
 
-    task = create_invoice_task(
-        message=message,
-        batch=batch,
+        receipts: list[
+            dict[str, Any]
+        ] = []
+
+        owner = principal_hash(token)
+
+        for execution in executions:
+            if not isinstance(
+                execution,
+                dict,
+            ):
+                return rpc_error(
+                    request_id=request_id,
+                    code=-32602,
+                    message="Invalid execution object",
+                    status_code=400,
+                )
+
+            key = (
+                execution.get("packageId"),
+                execution.get("actionId"),
+                execution.get("action"),
+            )
+
+            proposal = proposal_map.get(key)
+
+            if proposal is None:
+                return rpc_error(
+                    request_id=request_id,
+                    code=-32013,
+                    message=(
+                        "Execution does not match "
+                        "a stored proposal"
+                    ),
+                    status_code=409,
+                )
+
+            if execution.get("outcome") != "ACCEPTED":
+                return rpc_error(
+                    request_id=request_id,
+                    code=-32602,
+                    message=(
+                        "Execution outcome must be ACCEPTED"
+                    ),
+                    status_code=400,
+                )
+
+            receipt_nonce = execution.get(
+                "receiptNonce"
+            )
+
+            if not isinstance(
+                receipt_nonce,
+                str,
+            ) or not receipt_nonce:
+                return rpc_error(
+                    request_id=request_id,
+                    code=-32602,
+                    message="receiptNonce is required",
+                    status_code=400,
+                )
+
+            receipt_key = (
+                f"{owner}:"
+                f"{task_id}:"
+                f"{proposal['packageId']}:"
+                f"{proposal['actionId']}"
+            )
+
+            existing_receipt = (
+                STATE
+                .setdefault("receipts", {})
+                .get(receipt_key)
+            )
+
+            if existing_receipt is not None:
+                if (
+                    existing_receipt[
+                        "receiptNonce"
+                    ] != receipt_nonce
+                ):
+                    return rpc_error(
+                        request_id=request_id,
+                        code=-32014,
+                        message=(
+                            "Receipt nonce conflict"
+                        ),
+                        status_code=409,
+                    )
+
+                receipts.append(
+                    existing_receipt
+                )
+                continue
+
+            receipt = {
+                "receiptId": str(uuid.uuid4()),
+                "taskId": task_id,
+                "packageId": proposal[
+                    "packageId"
+                ],
+                "actionId": proposal[
+                    "actionId"
+                ],
+                "action": proposal[
+                    "action"
+                ],
+                "receiptNonce": receipt_nonce,
+                "status": "EXECUTED",
+                "timestamp": now_iso(),
+                "facts": proposal.get(
+                    "facts",
+                    {},
+                ),
+                "evidenceRefs": proposal.get(
+                    "evidenceRefs",
+                    [],
+                ),
+            }
+
+            STATE[
+                "receipts"
+            ][receipt_key] = receipt
+
+            receipts.append(receipt)
+
+        task["artifacts"].append(
+            {
+                "artifactId": str(uuid.uuid4()),
+                "name": "invoice-action-receipts",
+                "parts": [
+                    {
+                        "mediaType": RECEIPT_MEDIA_TYPE,
+                        "data": {
+                            "receipts": receipts,
+                        },
+                    }
+                ],
+            }
+        )
+
+        task["status"] = {
+            "state": TASK_STATE_COMPLETED,
+            "timestamp": now_iso(),
+        }
+
+        update_task(
+            token=token,
+            task=task,
+        )
+
+        save_state()
+
+        return rpc_success(
+            request_id=request_id,
+            result={
+                "task": task,
+            },
+        )
+
+
+@app.post("/a2a/tasks/{task_id}/continue")
+async def continue_a2a_task(
+    task_id: str,
+    request: Request,
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    return await continue_task(
+        task_id=task_id,
+        request=request,
+        token=token,
     )
 
-    return rpc_success(
-        request_id=request_id,
-        result={
-            "task": task,
-        },
-    )
 
+# ============================================================
+# Message routes
+# ============================================================
 
 @app.post("/message:send")
 async def message_send(
     request: Request,
+    token: str = Depends(
+        require_bearer_token
+    ),
 ) -> JSONResponse:
-    return await process_message(request)
-
-
-@app.post("/message%3Asend")
-async def message_send_encoded(
-    request: Request,
-) -> JSONResponse:
-    return await process_message(request)
+    return await process_message(
+        request=request,
+        token=token,
+    )
 
 
 @app.post("/a2a/message:send")
 async def a2a_message_send(
     request: Request,
+    token: str = Depends(
+        require_bearer_token
+    ),
 ) -> JSONResponse:
-    return await process_message(request)
+    return await process_message(
+        request=request,
+        token=token,
+    )
 
 
 # ============================================================
-# Error handling
+# Error handlers
 # ============================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(
+    request: Request,
+    exc: HTTPException,
+) -> JSONResponse:
+    headers = exc.headers or {}
+
+    return JSONResponse(
+        content={
+            "error": exc.detail,
+        },
+        status_code=exc.status_code,
+        headers=headers,
+        media_type=A2A_MEDIA_TYPE,
+    )
+
 
 @app.exception_handler(Exception)
 async def unhandled_exception(
     request: Request,
     exc: Exception,
 ) -> JSONResponse:
-    return json_response(
+    return a2a_response(
         {
             "jsonrpc": "2.0",
             "id": None,
