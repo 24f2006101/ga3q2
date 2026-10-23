@@ -1,6 +1,3 @@
-
-from __future__ import annotations
-
 import hashlib
 import json
 import os
@@ -60,7 +57,7 @@ if USE_LLM:
 
 BASE_URL = os.getenv(
     "BASE_URL",
-    "http://127.0.0.1:8000/a2a",
+    "http://127.0.0.1:8000",
 ).rstrip("/")
 
 DATABASE_URL = os.getenv(
@@ -100,7 +97,7 @@ ALLOWED_ACTIONS = {
 
 
 # ============================================================
-# LLM instruction
+# LLM instructions
 # ============================================================
 
 INVOICE_SYSTEM_PROMPT = """
@@ -288,23 +285,28 @@ def get_principal(
             detail="Unauthorized",
         )
 
-    if a2a_version != "1.0":
+    if a2a_version not in {None, "1.0"}:
         raise HTTPException(
             status_code=400,
             detail="Unsupported A2A version",
         )
 
-    if not content_type:
-        raise HTTPException(
-            status_code=415,
-            detail="Unsupported media type",
-        )
+    if content_type is not None:
+        content_type_base = content_type.split(
+            ";",
+            maxsplit=1,
+        )[0].strip()
 
-    if not content_type.startswith(A2A_MEDIA_TYPE):
-        raise HTTPException(
-            status_code=415,
-            detail="Unsupported media type",
-        )
+        allowed_content_types = {
+            A2A_MEDIA_TYPE,
+            "application/json",
+        }
+
+        if content_type_base not in allowed_content_types:
+            raise HTTPException(
+                status_code=415,
+                detail="Unsupported media type",
+            )
 
     return hashlib.sha256(
         token.encode("utf-8")
@@ -323,7 +325,7 @@ Principal = Annotated[
 
 
 # ============================================================
-# General helpers
+# Helpers
 # ============================================================
 
 def current_time() -> str:
@@ -421,7 +423,7 @@ def get_data_part(
 
 
 # ============================================================
-# Proposal validation
+# Validation
 # ============================================================
 
 def validate_proposal(
@@ -644,7 +646,7 @@ INVOICE_DECISION_SCHEMA: dict[str, Any] = {
 
 
 # ============================================================
-# Non-LLM fallback
+# Non-LLM decision
 # ============================================================
 
 def fallback_decision(
@@ -705,30 +707,28 @@ def fallback_decision(
             "Fallback requires exactly three known evidence references"
         )
 
-    facts = {
-        "vendorName": package.get(
-            "vendorName",
-            "Unknown",
-        ),
-        "invoiceNumber": package.get(
-            "invoiceNumber",
-            "Unknown",
-        ),
-        "amountMinor": package.get(
-            "amountMinor",
-            0,
-        ),
-        "currency": package.get(
-            "currency",
-            "INR",
-        ),
-    }
-
     return {
         "packageId": package_id,
         "actionId": str(uuid.uuid4()),
         "action": action,
-        "facts": facts,
+        "facts": {
+            "vendorName": package.get(
+                "vendorName",
+                "Unknown",
+            ),
+            "invoiceNumber": package.get(
+                "invoiceNumber",
+                "Unknown",
+            ),
+            "amountMinor": package.get(
+                "amountMinor",
+                0,
+            ),
+            "currency": package.get(
+                "currency",
+                "INR",
+            ),
+        },
         "evidenceRefs": evidence_refs,
         "rationale": (
             f"{action}: the local rule-based evaluator selected "
@@ -822,7 +822,7 @@ def llm_decision(
 
 
 # ============================================================
-# Choose LLM or fallback
+# Decision selection and caching
 # ============================================================
 
 def decide_package(
@@ -883,7 +883,6 @@ def decide_package(
     )
 
     cached_proposal = dict(proposal)
-
     cached_proposal["actionId"] = (
         "CACHE_ACTION_ID_REPLACED_PER_TASK"
     )
@@ -968,27 +967,22 @@ def build_proposals(
                 detail=f"LLM decision failed: {error}",
             ) from error
 
-        proposal_action_id = proposal.get(
-            "actionId"
-        )
+        action_id = proposal.get("actionId")
 
-        if not isinstance(
-            proposal_action_id,
-            str,
-        ):
+        if not isinstance(action_id, str):
             raise HTTPException(
                 status_code=500,
                 detail="Generated actionId is invalid",
             )
 
-        if proposal_action_id in action_ids:
+        if action_id in action_ids:
             raise HTTPException(
                 status_code=500,
                 detail="Duplicate actionId",
             )
 
         package_ids.add(package_id)
-        action_ids.add(proposal_action_id)
+        action_ids.add(action_id)
         proposals.append(proposal)
 
     return {
@@ -1044,14 +1038,13 @@ def agent_card() -> dict[str, Any]:
 
 
 # ============================================================
-# Send message
+# Main message handler
 # ============================================================
 
-@app.post("/a2a/message:send")
-async def send_message(
+async def handle_send_message(
     request: Request,
-    principal: Principal,
-    db: DatabaseSession,
+    principal: str,
+    db: Session,
 ) -> JSONResponse:
     payload = await request.json()
 
@@ -1207,7 +1200,7 @@ async def send_message(
         )
 
     if RESULT_MEDIA_TYPE in media_types:
-        return process_result_continuation(
+        return await process_result_continuation(
             message=message,
             principal=principal,
             message_id=message_id,
@@ -1222,10 +1215,40 @@ async def send_message(
 
 
 # ============================================================
+# Both evaluator and legacy message paths
+# ============================================================
+
+@app.post("/message:send")
+async def send_message_root(
+    request: Request,
+    principal: Principal,
+    db: DatabaseSession,
+) -> JSONResponse:
+    return await handle_send_message(
+        request=request,
+        principal=principal,
+        db=db,
+    )
+
+
+@app.post("/a2a/message:send")
+async def send_message_a2a(
+    request: Request,
+    principal: Principal,
+    db: DatabaseSession,
+) -> JSONResponse:
+    return await handle_send_message(
+        request=request,
+        principal=principal,
+        db=db,
+    )
+
+
+# ============================================================
 # Result continuation
 # ============================================================
 
-def process_result_continuation(
+async def process_result_continuation(
     message: dict[str, Any],
     principal: str,
     message_id: str,
@@ -1345,7 +1368,7 @@ def process_result_continuation(
                     detail="Invalid stored proposal",
                 )
 
-            proposal_key = (
+            key = (
                 proposal.get("packageId"),
                 proposal.get("actionId"),
                 proposal.get("action"),
@@ -1353,14 +1376,14 @@ def process_result_continuation(
 
             if not all(
                 isinstance(value, str)
-                for value in proposal_key
+                for value in key
             ):
                 raise HTTPException(
                     status_code=409,
                     detail="Invalid stored proposal fields",
                 )
 
-            proposals_by_key[proposal_key] = proposal
+            proposals_by_key[key] = proposal
 
         results = result_data.get("results")
 
@@ -1599,4 +1622,3 @@ def cancel_task(
         db.commit()
 
         return a2a_response(task)
-
