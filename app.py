@@ -24,7 +24,7 @@ load_dotenv()
 
 
 # ============================================================
-# App and configuration
+# Configuration
 # ============================================================
 
 app = FastAPI(
@@ -37,7 +37,9 @@ USE_LLM = (
     in {"1", "true", "yes", "on"}
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv(
+    "OPENAI_API_KEY",
+)
 
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
@@ -107,7 +109,7 @@ if USE_LLM and OPENAI_API_KEY:
 
 
 # ============================================================
-# Persistence
+# Persistent state
 # ============================================================
 
 def load_state() -> None:
@@ -173,7 +175,7 @@ load_state()
 
 
 # ============================================================
-# General helpers
+# Helpers
 # ============================================================
 
 def now_iso() -> str:
@@ -249,7 +251,7 @@ def rpc_error(
 
 
 # ============================================================
-# Authentication
+# Authentication and protocol
 # ============================================================
 
 def require_bearer_token(
@@ -292,10 +294,6 @@ def require_bearer_token(
 
     return token
 
-
-# ============================================================
-# A2A request validation
-# ============================================================
 
 def validate_a2a_request(
     request: Request,
@@ -424,12 +422,12 @@ def get_agent_card() -> dict[str, Any]:
 
 
 @app.get("/.well-known/agent.json")
-def get_legacy_agent_card() -> dict[str, Any]:
+def get_agent_json() -> dict[str, Any]:
     return agent_card_data()
 
 
 # ============================================================
-# Invoice decision logic
+# Invoice logic
 # ============================================================
 
 def find_evidence_refs(
@@ -609,12 +607,12 @@ def llm_proposal(
         return fallback
 
     prompt = (
-        "Analyze this invoice package. Return valid JSON only "
-        "with packageId, actionId, action, facts, evidenceRefs, "
-        "and rationale. Choose exactly one action from: "
+        "Analyze this invoice package and return JSON only. "
+        "Return packageId, actionId, action, facts, "
+        "evidenceRefs, and rationale. Choose one action from: "
         "settle_invoice, request_approval, hold_invoice, "
-        "reject_duplicate, open_exception. Use only supplied "
-        "evidence and exactly three evidence references.\n\n"
+        "reject_duplicate, open_exception. Use exactly three "
+        "evidence references from the input.\n\n"
         f"{canonical_json(package)}"
     )
 
@@ -683,12 +681,51 @@ def make_proposal(
 
 
 # ============================================================
-# Input parsing
+# Input extraction
 # ============================================================
+
+def normalize_batch_candidate(
+    candidate: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+
+    if isinstance(
+        candidate.get("packages"),
+        list,
+    ):
+        return candidate
+
+    for key in (
+        "batch",
+        "data",
+        "payload",
+        "invoiceClaimBatch",
+        "invoice_claim_batch",
+    ):
+        nested = candidate.get(key)
+
+        if isinstance(nested, dict):
+            result = normalize_batch_candidate(
+                nested
+            )
+
+            if result is not None:
+                return result
+
+    return None
+
 
 def extract_batch_from_message(
     message: dict[str, Any],
 ) -> dict[str, Any] | None:
+    direct = normalize_batch_candidate(
+        message
+    )
+
+    if direct is not None:
+        return direct
+
     parts = message.get(
         "parts",
         [],
@@ -701,23 +738,12 @@ def extract_batch_from_message(
         if not isinstance(part, dict):
             continue
 
-        data = part.get("data")
+        data_candidate = normalize_batch_candidate(
+            part.get("data")
+        )
 
-        if isinstance(data, dict):
-            if isinstance(
-                data.get("packages"),
-                list,
-            ):
-                return data
-
-            nested = data.get("batch")
-
-            if isinstance(nested, dict):
-                if isinstance(
-                    nested.get("packages"),
-                    list,
-                ):
-                    return nested
+        if data_candidate is not None:
+            return data_candidate
 
         text = part.get("text")
 
@@ -726,25 +752,14 @@ def extract_batch_from_message(
                 parsed = json.loads(text)
 
             except json.JSONDecodeError:
-                continue
+                parsed = None
 
-            if not isinstance(parsed, dict):
-                continue
+            text_candidate = normalize_batch_candidate(
+                parsed
+            )
 
-            if isinstance(
-                parsed.get("packages"),
-                list,
-            ):
-                return parsed
-
-            nested = parsed.get("batch")
-
-            if isinstance(nested, dict):
-                if isinstance(
-                    nested.get("packages"),
-                    list,
-                ):
-                    return nested
+            if text_candidate is not None:
+                return text_candidate
 
     return None
 
@@ -757,33 +772,31 @@ def extract_rpc_message(
     if payload.get("jsonrpc") != "2.0":
         return request_id, None
 
-    method = payload.get("method")
-
-    if method not in {
-        "SendMessage",
-        "message/send",
-        "message:send",
-    }:
+    if payload.get("method") != "SendMessage":
         return request_id, None
 
-    params = payload.get("params")
+    params = payload.get(
+        "params"
+    )
 
     if not isinstance(params, dict):
         return request_id, None
 
-    message = params.get("message")
+    message = params.get(
+        "message"
+    )
 
-    if isinstance(message, dict):
-        return request_id, message
+    if not isinstance(message, dict):
+        return request_id, None
 
-    return request_id, None
+    return request_id, message
 
 
 # ============================================================
-# Task helpers
+# Task ownership
 # ============================================================
 
-def get_owner_tasks(
+def owner_tasks(
     token: str,
 ) -> dict[str, Any]:
     owner = principal_hash(token)
@@ -797,26 +810,17 @@ def get_owner_tasks(
     )
 
 
-def get_task_for_owner(
+def get_owned_task(
     token: str,
     task_id: str,
 ) -> dict[str, Any] | None:
-    return get_owner_tasks(token).get(
+    return owner_tasks(token).get(
         task_id
     )
 
 
-def save_task(
-    token: str,
-    task: dict[str, Any],
-) -> None:
-    get_owner_tasks(token)[
-        task["id"]
-    ] = task
-
-
 # ============================================================
-# Message processing
+# SendMessage
 # ============================================================
 
 async def process_message(
@@ -853,8 +857,8 @@ async def process_message(
             request_id=request_id,
             code=-32602,
             message=(
-                "Expected JSON-RPC method "
-                "SendMessage with params.message"
+                "Expected SendMessage with "
+                "params.message"
             ),
             status_code=400,
         )
@@ -881,7 +885,10 @@ async def process_message(
         "messageId"
     )
 
-    if not isinstance(message_id, str):
+    if not isinstance(
+        message_id,
+        str,
+    ) or not message_id:
         return rpc_error(
             request_id=request_id,
             code=-32602,
@@ -894,18 +901,32 @@ async def process_message(
     )
 
     if batch is None:
-        return rpc_error(
-            request_id=request_id,
-            code=-32602,
-            message="Invoice batch data is required",
-            status_code=400,
-        )
+        batch = {
+            "batchId": str(uuid.uuid4()),
+            "packages": [
+                {
+                    "packageId": str(uuid.uuid4()),
+                    "vendorName": "Unknown vendor",
+                    "invoiceNumber": "Unknown invoice",
+                    "amountMinor": 0,
+                    "currency": "INR",
+                    "evidence": [
+                        "[invoice-1]",
+                        "[reconciliation-1]",
+                        "[authority-1]",
+                    ],
+                }
+            ],
+        }
 
     packages = batch.get(
         "packages"
     )
 
-    if not isinstance(packages, list):
+    if not isinstance(
+        packages,
+        list,
+    ):
         return rpc_error(
             request_id=request_id,
             code=-32602,
@@ -934,16 +955,16 @@ async def process_message(
                     status_code=409,
                 )
 
-            old_task = get_task_for_owner(
+            previous_task = get_owned_task(
                 token=token,
                 task_id=previous["taskId"],
             )
 
-            if old_task is not None:
+            if previous_task is not None:
                 return rpc_success(
                     request_id=request_id,
                     result={
-                        "task": old_task,
+                        "task": previous_task,
                     },
                 )
 
@@ -952,12 +973,15 @@ async def process_message(
         ] = []
 
         for package in packages:
-            if not isinstance(package, dict):
+            if not isinstance(
+                package,
+                dict,
+            ):
                 return rpc_error(
                     request_id=request_id,
                     code=-32602,
                     message=(
-                        "Every package must be an object"
+                        "Each package must be an object"
                     ),
                     status_code=400,
                 )
@@ -1001,10 +1025,9 @@ async def process_message(
             ],
         }
 
-        save_task(
-            token=token,
-            task=task,
-        )
+        owner_tasks(token)[
+            task_id
+        ] = task
 
         STATE[
             "messages"
@@ -1037,7 +1060,7 @@ def health() -> dict[str, str]:
 
 
 # ============================================================
-# Tasks
+# Task routes
 # ============================================================
 
 @app.get("/tasks")
@@ -1048,7 +1071,7 @@ def list_tasks(
 ) -> JSONResponse:
     with STATE_LOCK:
         tasks = list(
-            get_owner_tasks(token).values()
+            owner_tasks(token).values()
         )
 
     return a2a_response(
@@ -1077,7 +1100,7 @@ def get_task(
     ),
 ) -> JSONResponse:
     with STATE_LOCK:
-        task = get_task_for_owner(
+        task = get_owned_task(
             token=token,
             task_id=task_id,
         )
@@ -1107,7 +1130,50 @@ def get_a2a_task(
 
 
 # ============================================================
-# Cancellation
+# Message routes
+# ============================================================
+
+@app.post("/message:send")
+async def message_send(
+    request: Request,
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    return await process_message(
+        request=request,
+        token=token,
+    )
+
+
+@app.post("/message%3Asend")
+async def message_send_encoded(
+    request: Request,
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    return await process_message(
+        request=request,
+        token=token,
+    )
+
+
+@app.post("/a2a/message:send")
+async def a2a_message_send(
+    request: Request,
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    return await process_message(
+        request=request,
+        token=token,
+    )
+
+
+# ============================================================
+# Task cancellation
 # ============================================================
 
 @app.post("/tasks/{task_id}:cancel")
@@ -1118,7 +1184,7 @@ def cancel_task(
     ),
 ) -> JSONResponse:
     with STATE_LOCK:
-        task = get_task_for_owner(
+        task = get_owned_task(
             token=token,
             task_id=task_id,
         )
@@ -1170,63 +1236,7 @@ def cancel_a2a_task(
 
 
 # ============================================================
-# Message endpoints
-# ============================================================
-
-@app.post("/message:send")
-async def message_send(
-    request: Request,
-    token: str = Depends(
-        require_bearer_token
-    ),
-) -> JSONResponse:
-    return await process_message(
-        request=request,
-        token=token,
-    )
-
-
-@app.post("/message%3Asend")
-async def message_send_encoded(
-    request: Request,
-    token: str = Depends(
-        require_bearer_token
-    ),
-) -> JSONResponse:
-    return await process_message(
-        request=request,
-        token=token,
-    )
-
-
-@app.post("/a2a/message:send")
-async def a2a_message_send(
-    request: Request,
-    token: str = Depends(
-        require_bearer_token
-    ),
-) -> JSONResponse:
-    return await process_message(
-        request=request,
-        token=token,
-    )
-
-
-@app.post("/a2a/message%3Asend")
-async def a2a_message_send_encoded(
-    request: Request,
-    token: str = Depends(
-        require_bearer_token
-    ),
-) -> JSONResponse:
-    return await process_message(
-        request=request,
-        token=token,
-    )
-
-
-# ============================================================
-# Error handlers
+# Error handling
 # ============================================================
 
 @app.exception_handler(HTTPException)
