@@ -3,4 +3,3 @@ uvicorn[standard]
 sqlalchemy
 python-dotenv
 openai
-EOF
