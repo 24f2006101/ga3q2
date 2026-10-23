@@ -1599,4 +1599,4 @@ def cancel_task(
         db.commit()
 
         return a2a_response(task)
-PYTHON
+
