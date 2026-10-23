@@ -1,0 +1,35 @@
+cat > test_batch_llm.json <<'JSON'
+{
+  "message": {
+    "messageId": "test-message-002",
+    "role": "ROLE_USER",
+    "parts": [
+      {
+        "mediaType": "application/vnd.ga5.invoice-claim-batch+json",
+        "data": {
+          "batchId": "test-batch-002",
+          "policyRevision": "policy-1",
+          "packages": [
+            {
+              "packageId": "package-002",
+              "vendorName": "Demo Supplies Ltd",
+              "invoiceNumber": "INV-1002",
+              "amountMinor": 125000,
+              "currency": "INR",
+              "document": "Invoice is valid, reconciled, and within authority. [invoice-1] [reconciliation-1] [authority-1]"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "configuration": {
+    "returnImmediately": false,
+    "historyLength": 20,
+    "acceptedOutputModes": [
+      "application/vnd.ga5.invoice-action-proposals+json",
+      "application/vnd.ga5.invoice-action-receipts+json"
+    ]
+  }
+}
+JSON
