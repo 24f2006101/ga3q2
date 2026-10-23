@@ -93,7 +93,7 @@ def json_response(
     return JSONResponse(
         content=content,
         status_code=status_code,
-        media_type="application/json",
+        media_type="application/a2a+json",
     )
 
 
@@ -566,11 +566,11 @@ def agent_card_data() -> dict[str, Any]:
             "schemes": [],
         },
         "defaultInputModes": [
-            "application/json",
+            "application/a2a+json",
             BATCH_MEDIA_TYPE,
         ],
         "defaultOutputModes": [
-            "application/json",
+            "application/a2a+json",
             PROPOSAL_MEDIA_TYPE,
             RECEIPT_MEDIA_TYPE,
         ],
