@@ -1,4 +1,4 @@
-cat > app.py <<'PYTHON'
+
 from __future__ import annotations
 
 import hashlib
