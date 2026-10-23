@@ -24,7 +24,7 @@ load_dotenv()
 
 
 # ============================================================
-# Configuration
+# App and configuration
 # ============================================================
 
 app = FastAPI(
@@ -37,9 +37,7 @@ USE_LLM = (
     in {"1", "true", "yes", "on"}
 )
 
-OPENAI_API_KEY = os.getenv(
-    "OPENAI_API_KEY",
-)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
@@ -57,7 +55,7 @@ STATE_FILE = os.getenv(
 )
 
 A2A_MEDIA_TYPE = "application/a2a+json"
-
+JSON_MEDIA_TYPE = "application/json"
 SUPPORTED_A2A_VERSION = "1.0"
 
 BATCH_MEDIA_TYPE = (
@@ -80,12 +78,17 @@ ALLOWED_ACTIONS = {
     "open_exception",
 }
 
-TASK_STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
-TASK_STATE_WORKING = "TASK_STATE_WORKING"
-TASK_STATE_INPUT_REQUIRED = "TASK_STATE_INPUT_REQUIRED"
-TASK_STATE_COMPLETED = "TASK_STATE_COMPLETED"
-TASK_STATE_CANCELED = "TASK_STATE_CANCELED"
-TASK_STATE_FAILED = "TASK_STATE_FAILED"
+TASK_STATE_INPUT_REQUIRED = (
+    "TASK_STATE_INPUT_REQUIRED"
+)
+
+TASK_STATE_COMPLETED = (
+    "TASK_STATE_COMPLETED"
+)
+
+TASK_STATE_CANCELED = (
+    "TASK_STATE_CANCELED"
+)
 
 STATE_LOCK = threading.RLock()
 
@@ -94,7 +97,6 @@ STATE: dict[str, Any] = {
     "messages": {},
     "receipts": {},
 }
-
 
 OPENAI_CLIENT: OpenAI | None = None
 
@@ -105,7 +107,7 @@ if USE_LLM and OPENAI_API_KEY:
 
 
 # ============================================================
-# Persistent state
+# Persistence
 # ============================================================
 
 def load_state() -> None:
@@ -122,10 +124,6 @@ def load_state() -> None:
         if isinstance(loaded, dict):
             STATE = loaded
 
-        STATE.setdefault("tasks", {})
-        STATE.setdefault("messages", {})
-        STATE.setdefault("receipts", {})
-
     except (
         FileNotFoundError,
         json.JSONDecodeError,
@@ -136,6 +134,10 @@ def load_state() -> None:
             "messages": {},
             "receipts": {},
         }
+
+    STATE.setdefault("tasks", {})
+    STATE.setdefault("messages", {})
+    STATE.setdefault("receipts", {})
 
 
 def save_state() -> None:
@@ -189,20 +191,16 @@ def canonical_json(value: Any) -> str:
     )
 
 
-def sha256_text(value: str) -> str:
+def value_hash(value: Any) -> str:
     return hashlib.sha256(
-        value.encode("utf-8")
+        canonical_json(value).encode("utf-8")
     ).hexdigest()
 
 
-def value_hash(value: Any) -> str:
-    return sha256_text(
-        canonical_json(value)
-    )
-
-
 def principal_hash(token: str) -> str:
-    return sha256_text(token)
+    return hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
 
 
 def a2a_response(
@@ -251,7 +249,7 @@ def rpc_error(
 
 
 # ============================================================
-# Authentication and protocol
+# Authentication
 # ============================================================
 
 def require_bearer_token(
@@ -295,6 +293,10 @@ def require_bearer_token(
     return token
 
 
+# ============================================================
+# A2A request validation
+# ============================================================
+
 def validate_a2a_request(
     request: Request,
 ) -> None:
@@ -312,29 +314,25 @@ def validate_a2a_request(
         )
 
     content_type = request.headers.get(
-        "Content-Type"
+        "Content-Type",
+        "",
     )
-
-    if not content_type:
-        raise HTTPException(
-            status_code=415,
-            detail=(
-                "Content-Type must be "
-                "application/a2a+json"
-            ),
-        )
 
     media_type = content_type.split(
         ";",
         maxsplit=1,
     )[0].strip().lower()
 
-    if media_type != A2A_MEDIA_TYPE:
+    if media_type not in {
+        A2A_MEDIA_TYPE,
+        JSON_MEDIA_TYPE,
+    }:
         raise HTTPException(
             status_code=415,
             detail=(
                 "Content-Type must be "
-                "application/a2a+json"
+                "application/a2a+json or "
+                "application/json"
             ),
         )
 
@@ -361,6 +359,7 @@ def agent_card_data() -> dict[str, Any]:
             "extendedAgentCard": False,
         },
         "defaultInputModes": [
+            JSON_MEDIA_TYPE,
             A2A_MEDIA_TYPE,
             BATCH_MEDIA_TYPE,
         ],
@@ -405,6 +404,7 @@ def agent_card_data() -> dict[str, Any]:
                     "Create receipts for accepted actions.",
                 ],
                 "inputModes": [
+                    JSON_MEDIA_TYPE,
                     A2A_MEDIA_TYPE,
                     BATCH_MEDIA_TYPE,
                 ],
@@ -429,19 +429,13 @@ def get_legacy_agent_card() -> dict[str, Any]:
 
 
 # ============================================================
-# Business logic
+# Invoice decision logic
 # ============================================================
-
-def package_text(
-    package: dict[str, Any],
-) -> str:
-    return canonical_json(package)
-
 
 def find_evidence_refs(
     package: dict[str, Any],
 ) -> list[str]:
-    text = package_text(package)
+    text = canonical_json(package)
 
     known_refs = [
         "[invoice-1]",
@@ -495,7 +489,7 @@ def find_evidence_refs(
 def choose_action(
     package: dict[str, Any],
 ) -> str:
-    text = package_text(package).lower()
+    text = canonical_json(package).lower()
 
     if (
         "duplicate" in text
@@ -621,7 +615,7 @@ def llm_proposal(
         "settle_invoice, request_approval, hold_invoice, "
         "reject_duplicate, open_exception. Use only supplied "
         "evidence and exactly three evidence references.\n\n"
-        f"{package_text(package)}"
+        f"{canonical_json(package)}"
     )
 
     try:
@@ -716,16 +710,14 @@ def extract_batch_from_message(
             ):
                 return data
 
-            nested_batch = data.get(
-                "batch"
-            )
+            nested = data.get("batch")
 
-            if isinstance(nested_batch, dict):
+            if isinstance(nested, dict):
                 if isinstance(
-                    nested_batch.get("packages"),
+                    nested.get("packages"),
                     list,
                 ):
-                    return nested_batch
+                    return nested
 
         text = part.get("text")
 
@@ -745,16 +737,14 @@ def extract_batch_from_message(
             ):
                 return parsed
 
-            nested_batch = parsed.get(
-                "batch"
-            )
+            nested = parsed.get("batch")
 
-            if isinstance(nested_batch, dict):
+            if isinstance(nested, dict):
                 if isinstance(
-                    nested_batch.get("packages"),
+                    nested.get("packages"),
                     list,
                 ):
-                    return nested_batch
+                    return nested
 
     return None
 
@@ -767,7 +757,13 @@ def extract_rpc_message(
     if payload.get("jsonrpc") != "2.0":
         return request_id, None
 
-    if payload.get("method") != "message/send":
+    method = payload.get("method")
+
+    if method not in {
+        "SendMessage",
+        "message/send",
+        "message:send",
+    }:
         return request_id, None
 
     params = payload.get("params")
@@ -777,27 +773,36 @@ def extract_rpc_message(
 
     message = params.get("message")
 
-    if not isinstance(message, dict):
-        return request_id, None
+    if isinstance(message, dict):
+        return request_id, message
 
-    return request_id, message
+    return request_id, None
 
 
 # ============================================================
 # Task helpers
 # ============================================================
 
-def task_for_principal(
+def get_owner_tasks(
+    token: str,
+) -> dict[str, Any]:
+    owner = principal_hash(token)
+
+    return STATE.setdefault(
+        "tasks",
+        {},
+    ).setdefault(
+        owner,
+        {},
+    )
+
+
+def get_task_for_owner(
     token: str,
     task_id: str,
 ) -> dict[str, Any] | None:
-    owner = principal_hash(token)
-
-    return (
-        STATE
-        .get("tasks", {})
-        .get(owner, {})
-        .get(task_id)
+    return get_owner_tasks(token).get(
+        task_id
     )
 
 
@@ -805,31 +810,9 @@ def save_task(
     token: str,
     task: dict[str, Any],
 ) -> None:
-    owner = principal_hash(token)
-
-    STATE.setdefault(
-        "tasks",
-        {},
-    )
-
-    STATE["tasks"].setdefault(
-        owner,
-        {},
-    )
-
-    STATE["tasks"][owner][
+    get_owner_tasks(token)[
         task["id"]
     ] = task
-
-
-def update_task(
-    token: str,
-    task: dict[str, Any],
-) -> None:
-    save_task(
-        token=token,
-        task=task,
-    )
 
 
 # ============================================================
@@ -861,24 +844,6 @@ async def process_message(
             status_code=400,
         )
 
-    request_id = payload.get("id")
-
-    if payload.get("jsonrpc") != "2.0":
-        return rpc_error(
-            request_id=request_id,
-            code=-32600,
-            message="jsonrpc must be 2.0",
-            status_code=400,
-        )
-
-    if payload.get("method") != "message/send":
-        return rpc_error(
-            request_id=request_id,
-            code=-32601,
-            message="method must be message/send",
-            status_code=400,
-        )
-
     request_id, message = extract_rpc_message(
         payload
     )
@@ -887,16 +852,22 @@ async def process_message(
         return rpc_error(
             request_id=request_id,
             code=-32602,
-            message="params.message is required",
+            message=(
+                "Expected JSON-RPC method "
+                "SendMessage with params.message"
+            ),
             status_code=400,
         )
 
-    role = message.get("role")
-
-    if role not in {
+    role = message.get(
+        "role",
         "ROLE_USER",
-        "user",
-    }:
+    )
+
+    if role == "user":
+        role = "ROLE_USER"
+
+    if role != "ROLE_USER":
         return rpc_error(
             request_id=request_id,
             code=-32602,
@@ -944,19 +915,18 @@ async def process_message(
 
     owner = principal_hash(token)
     message_key = f"{owner}:{message_id}"
-    message_hash = value_hash(message)
+    message_digest = value_hash(message)
 
     with STATE_LOCK:
-        previous = (
-            STATE
-            .setdefault("messages", {})
-            .get(message_key)
-        )
+        previous = STATE.setdefault(
+            "messages",
+            {},
+        ).get(message_key)
 
         if previous is not None:
             if previous.get(
                 "messageHash"
-            ) != message_hash:
+            ) != message_digest:
                 return rpc_error(
                     request_id=request_id,
                     code=-32009,
@@ -964,7 +934,7 @@ async def process_message(
                     status_code=409,
                 )
 
-            old_task = task_for_principal(
+            old_task = get_task_for_owner(
                 token=token,
                 task_id=previous["taskId"],
             )
@@ -1036,31 +1006,26 @@ async def process_message(
             task=task,
         )
 
-        STATE.setdefault(
-            "messages",
-            {},
-        )
-
-        STATE["messages"][
-            message_key
-        ] = {
+        STATE[
+            "messages"
+        ][message_key] = {
             "taskId": task_id,
-            "messageHash": message_hash,
+            "messageHash": message_digest,
             "createdAt": now_iso(),
         }
 
         save_state()
 
-        return rpc_success(
-            request_id=request_id,
-            result={
-                "task": task,
-            },
-        )
+    return rpc_success(
+        request_id=request_id,
+        result={
+            "task": task,
+        },
+    )
 
 
 # ============================================================
-# Health and discovery
+# Health
 # ============================================================
 
 @app.get("/")
@@ -1072,7 +1037,7 @@ def health() -> dict[str, str]:
 
 
 # ============================================================
-# Task endpoints
+# Tasks
 # ============================================================
 
 @app.get("/tasks")
@@ -1081,14 +1046,9 @@ def list_tasks(
         require_bearer_token
     ),
 ) -> JSONResponse:
-    owner = principal_hash(token)
-
     with STATE_LOCK:
         tasks = list(
-            STATE
-            .get("tasks", {})
-            .get(owner, {})
-            .values()
+            get_owner_tasks(token).values()
         )
 
     return a2a_response(
@@ -1117,7 +1077,7 @@ def get_task(
     ),
 ) -> JSONResponse:
     with STATE_LOCK:
-        task = task_for_principal(
+        task = get_task_for_owner(
             token=token,
             task_id=task_id,
         )
@@ -1158,7 +1118,7 @@ def cancel_task(
     ),
 ) -> JSONResponse:
     with STATE_LOCK:
-        task = task_for_principal(
+        task = get_task_for_owner(
             token=token,
             task_id=task_id,
         )
@@ -1181,9 +1141,7 @@ def cancel_task(
         }:
             return a2a_response(
                 {
-                    "error": (
-                        "Task is already terminal"
-                    ),
+                    "error": "Task is already terminal",
                 },
                 status_code=409,
             )
@@ -1193,14 +1151,9 @@ def cancel_task(
             "timestamp": now_iso(),
         }
 
-        update_task(
-            token=token,
-            task=task,
-        )
-
         save_state()
 
-        return a2a_response(task)
+    return a2a_response(task)
 
 
 @app.post("/a2a/tasks/{task_id}:cancel")
@@ -1217,341 +1170,24 @@ def cancel_a2a_task(
 
 
 # ============================================================
-# Continuation
+# Message endpoints
 # ============================================================
 
-@app.post("/tasks/{task_id}/continue")
-async def continue_task(
-    task_id: str,
+@app.post("/message:send")
+async def message_send(
     request: Request,
     token: str = Depends(
         require_bearer_token
     ),
 ) -> JSONResponse:
-    validate_a2a_request(request)
-
-    try:
-        payload = await request.json()
-
-    except Exception:
-        return rpc_error(
-            request_id=None,
-            code=-32700,
-            message="Invalid JSON",
-            status_code=400,
-        )
-
-    request_id = payload.get("id")
-
-    with STATE_LOCK:
-        task = task_for_principal(
-            token=token,
-            task_id=task_id,
-        )
-
-        if task is None:
-            return rpc_error(
-                request_id=request_id,
-                code=-32004,
-                message="Task not found",
-                status_code=404,
-            )
-
-        current_state = task[
-            "status"
-        ]["state"]
-
-        if current_state == TASK_STATE_CANCELED:
-            return rpc_error(
-                request_id=request_id,
-                code=-32010,
-                message="Task is canceled",
-                status_code=409,
-            )
-
-        if current_state == TASK_STATE_COMPLETED:
-            return rpc_error(
-                request_id=request_id,
-                code=-32011,
-                message="Task is already completed",
-                status_code=409,
-            )
-
-        _, message = extract_rpc_message(
-            payload
-        )
-
-        if message is None:
-            return rpc_error(
-                request_id=request_id,
-                code=-32602,
-                message="params.message is required",
-                status_code=400,
-            )
-
-        result_data = None
-
-        params = payload.get(
-            "params"
-        )
-
-        if isinstance(params, dict):
-            candidate = params.get(
-                "result"
-            )
-
-            if isinstance(candidate, dict):
-                result_data = candidate
-
-        if result_data is None:
-            result_data = extract_batch_from_message(
-                message
-            )
-
-        if not isinstance(result_data, dict):
-            return rpc_error(
-                request_id=request_id,
-                code=-32602,
-                message="Execution result is required",
-                status_code=400,
-            )
-
-        executions = result_data.get(
-            "executions"
-        )
-
-        if not isinstance(executions, list):
-            return rpc_error(
-                request_id=request_id,
-                code=-32602,
-                message="executions must be a list",
-                status_code=400,
-            )
-
-        proposal_artifact = None
-
-        for artifact in task.get(
-            "artifacts",
-            [],
-        ):
-            if (
-                artifact.get("name")
-                == "invoice-action-proposals"
-            ):
-                proposal_artifact = artifact
-                break
-
-        if proposal_artifact is None:
-            return rpc_error(
-                request_id=request_id,
-                code=-32012,
-                message="Proposal artifact not found",
-                status_code=409,
-            )
-
-        proposal_data = (
-            proposal_artifact
-            .get("parts", [{}])[0]
-            .get("data", {})
-        )
-
-        proposals = proposal_data.get(
-            "proposals",
-            [],
-        )
-
-        proposal_map = {
-            (
-                proposal.get("packageId"),
-                proposal.get("actionId"),
-                proposal.get("action"),
-            ): proposal
-            for proposal in proposals
-            if isinstance(proposal, dict)
-        }
-
-        receipts: list[
-            dict[str, Any]
-        ] = []
-
-        owner = principal_hash(token)
-
-        for execution in executions:
-            if not isinstance(
-                execution,
-                dict,
-            ):
-                return rpc_error(
-                    request_id=request_id,
-                    code=-32602,
-                    message="Invalid execution object",
-                    status_code=400,
-                )
-
-            key = (
-                execution.get("packageId"),
-                execution.get("actionId"),
-                execution.get("action"),
-            )
-
-            proposal = proposal_map.get(key)
-
-            if proposal is None:
-                return rpc_error(
-                    request_id=request_id,
-                    code=-32013,
-                    message=(
-                        "Execution does not match "
-                        "a stored proposal"
-                    ),
-                    status_code=409,
-                )
-
-            if execution.get("outcome") != "ACCEPTED":
-                return rpc_error(
-                    request_id=request_id,
-                    code=-32602,
-                    message=(
-                        "Execution outcome must be ACCEPTED"
-                    ),
-                    status_code=400,
-                )
-
-            receipt_nonce = execution.get(
-                "receiptNonce"
-            )
-
-            if not isinstance(
-                receipt_nonce,
-                str,
-            ) or not receipt_nonce:
-                return rpc_error(
-                    request_id=request_id,
-                    code=-32602,
-                    message="receiptNonce is required",
-                    status_code=400,
-                )
-
-            receipt_key = (
-                f"{owner}:"
-                f"{task_id}:"
-                f"{proposal['packageId']}:"
-                f"{proposal['actionId']}"
-            )
-
-            existing_receipt = (
-                STATE
-                .setdefault("receipts", {})
-                .get(receipt_key)
-            )
-
-            if existing_receipt is not None:
-                if (
-                    existing_receipt[
-                        "receiptNonce"
-                    ] != receipt_nonce
-                ):
-                    return rpc_error(
-                        request_id=request_id,
-                        code=-32014,
-                        message=(
-                            "Receipt nonce conflict"
-                        ),
-                        status_code=409,
-                    )
-
-                receipts.append(
-                    existing_receipt
-                )
-                continue
-
-            receipt = {
-                "receiptId": str(uuid.uuid4()),
-                "taskId": task_id,
-                "packageId": proposal[
-                    "packageId"
-                ],
-                "actionId": proposal[
-                    "actionId"
-                ],
-                "action": proposal[
-                    "action"
-                ],
-                "receiptNonce": receipt_nonce,
-                "status": "EXECUTED",
-                "timestamp": now_iso(),
-                "facts": proposal.get(
-                    "facts",
-                    {},
-                ),
-                "evidenceRefs": proposal.get(
-                    "evidenceRefs",
-                    [],
-                ),
-            }
-
-            STATE[
-                "receipts"
-            ][receipt_key] = receipt
-
-            receipts.append(receipt)
-
-        task["artifacts"].append(
-            {
-                "artifactId": str(uuid.uuid4()),
-                "name": "invoice-action-receipts",
-                "parts": [
-                    {
-                        "mediaType": RECEIPT_MEDIA_TYPE,
-                        "data": {
-                            "receipts": receipts,
-                        },
-                    }
-                ],
-            }
-        )
-
-        task["status"] = {
-            "state": TASK_STATE_COMPLETED,
-            "timestamp": now_iso(),
-        }
-
-        update_task(
-            token=token,
-            task=task,
-        )
-
-        save_state()
-
-        return rpc_success(
-            request_id=request_id,
-            result={
-                "task": task,
-            },
-        )
-
-
-@app.post("/a2a/tasks/{task_id}/continue")
-async def continue_a2a_task(
-    task_id: str,
-    request: Request,
-    token: str = Depends(
-        require_bearer_token
-    ),
-) -> JSONResponse:
-    return await continue_task(
-        task_id=task_id,
+    return await process_message(
         request=request,
         token=token,
     )
 
 
-# ============================================================
-# Message routes
-# ============================================================
-
-@app.post("/message:send")
-async def message_send(
+@app.post("/message%3Asend")
+async def message_send_encoded(
     request: Request,
     token: str = Depends(
         require_bearer_token
@@ -1576,6 +1212,19 @@ async def a2a_message_send(
     )
 
 
+@app.post("/a2a/message%3Asend")
+async def a2a_message_send_encoded(
+    request: Request,
+    token: str = Depends(
+        require_bearer_token
+    ),
+) -> JSONResponse:
+    return await process_message(
+        request=request,
+        token=token,
+    )
+
+
 # ============================================================
 # Error handlers
 # ============================================================
@@ -1585,14 +1234,12 @@ async def http_exception_handler(
     request: Request,
     exc: HTTPException,
 ) -> JSONResponse:
-    headers = exc.headers or {}
-
     return JSONResponse(
         content={
             "error": exc.detail,
         },
         status_code=exc.status_code,
-        headers=headers,
+        headers=exc.headers or {},
         media_type=A2A_MEDIA_TYPE,
     )
 
