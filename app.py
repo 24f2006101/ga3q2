@@ -1230,7 +1230,17 @@ async def send_message_root(
         db=db,
     )
 
-
+@app.post("/message%3Asend")
+async def send_message_encoded(
+    request: Request,
+    principal: Principal,
+    db: DatabaseSession,
+) -> JSONResponse:
+    return await handle_send_message(
+        request=request,
+        principal=principal,
+        db=db,
+    )
 @app.post("/a2a/message:send")
 async def send_message_a2a(
     request: Request,
