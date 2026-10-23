@@ -1,0 +1,7 @@
+cat > requirements.txt <<'EOF'
+fastapi
+uvicorn[standard]
+sqlalchemy
+python-dotenv
+openai
+EOF
