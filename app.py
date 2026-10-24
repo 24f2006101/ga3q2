@@ -36,9 +36,32 @@ OPENAI_MODEL = os.getenv(
     "gpt-4o-mini",
 )
 
-if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "OPENAI_API_KEY is missing. Add it to .env."
+USE_LLM = (
+    os.getenv("USE_LLM", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-4o-mini",
+)
+
+if USE_LLM and not OPENAI_API_KEY:
+    print(
+        "WARNING: USE_LLM is enabled but "
+        "OPENAI_API_KEY is missing. "
+        "Falling back to non-LLM mode."
+    )
+
+    USE_LLM = False
+
+OPENAI_CLIENT: OpenAI | None = None
+
+if USE_LLM and OPENAI_API_KEY:
+    OPENAI_CLIENT = OpenAI(
+        api_key=OPENAI_API_KEY,
     )
 
 llm_client = OpenAI(
