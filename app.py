@@ -10,7 +10,13 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+)
 from fastapi.responses import JSONResponse
 from openai import OpenAI
 from sqlalchemy import String, Text, create_engine
@@ -41,13 +47,6 @@ USE_LLM = (
     in {"1", "true", "yes", "on"}
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-OPENAI_MODEL = os.getenv(
-    "OPENAI_MODEL",
-    "gpt-4o-mini",
-)
-
 if USE_LLM and not OPENAI_API_KEY:
     print(
         "WARNING: USE_LLM is enabled but "
@@ -57,16 +56,12 @@ if USE_LLM and not OPENAI_API_KEY:
 
     USE_LLM = False
 
-OPENAI_CLIENT: OpenAI | None = None
+llm_client: OpenAI | None = None
 
 if USE_LLM and OPENAI_API_KEY:
-    OPENAI_CLIENT = OpenAI(
+    llm_client = OpenAI(
         api_key=OPENAI_API_KEY,
     )
-
-llm_client = OpenAI(
-    api_key=OPENAI_API_KEY,
-)
 
 
 # ============================================================
@@ -75,7 +70,7 @@ llm_client = OpenAI(
 
 BASE_URL = os.getenv(
     "BASE_URL",
-    "http://127.0.0.1:8000/a2a",
+    "https://ga3q2-a7fm.onrender.com",
 ).rstrip("/")
 
 DATABASE_URL = os.getenv(
@@ -84,6 +79,7 @@ DATABASE_URL = os.getenv(
 )
 
 A2A_MEDIA_TYPE = "application/a2a+json"
+JSON_MEDIA_TYPE = "application/json"
 
 BATCH_MEDIA_TYPE = (
     "application/vnd.ga5.invoice-claim-batch+json"
@@ -101,9 +97,17 @@ RECEIPT_MEDIA_TYPE = (
     "application/vnd.ga5.invoice-action-receipts+json"
 )
 
-TASK_STATE_INPUT_REQUIRED = "TASK_STATE_INPUT_REQUIRED"
-TASK_STATE_COMPLETED = "TASK_STATE_COMPLETED"
-TASK_STATE_CANCELED = "TASK_STATE_CANCELED"
+TASK_STATE_INPUT_REQUIRED = (
+    "TASK_STATE_INPUT_REQUIRED"
+)
+
+TASK_STATE_COMPLETED = (
+    "TASK_STATE_COMPLETED"
+)
+
+TASK_STATE_CANCELED = (
+    "TASK_STATE_CANCELED"
+)
 
 ALLOWED_ACTIONS = {
     "settle_invoice",
@@ -260,20 +264,27 @@ task_lock = threading.Lock()
 
 
 # ============================================================
-# FastAPI dependencies
+# Dependencies
 # ============================================================
 
-def get_database() -> Generator[Session, None, None]:
+def get_database() -> Generator[
+    Session,
+    None,
+    None,
+]:
     db = SessionLocal()
 
     try:
         yield db
+
     finally:
         db.close()
 
 
 def get_principal(
-    authorization: str | None = Header(default=None),
+    authorization: str | None = Header(
+        default=None,
+    ),
     a2a_version: str | None = Header(
         default=None,
         alias="A2A-Version",
@@ -289,13 +300,17 @@ def get_principal(
             detail="Unauthorized",
         )
 
-    if not authorization.startswith("Bearer "):
+    scheme, separator, token = authorization.partition(
+        " "
+    )
+
+    if scheme.lower() != "bearer" or not separator:
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
         )
 
-    token = authorization.removeprefix("Bearer ").strip()
+    token = token.strip()
 
     if not token:
         raise HTTPException(
@@ -315,7 +330,15 @@ def get_principal(
             detail="Unsupported media type",
         )
 
-    if not content_type.startswith(A2A_MEDIA_TYPE):
+    media_type = content_type.split(
+        ";",
+        maxsplit=1,
+    )[0].strip().lower()
+
+    if media_type not in {
+        A2A_MEDIA_TYPE,
+        JSON_MEDIA_TYPE,
+    }:
         raise HTTPException(
             status_code=415,
             detail="Unsupported media type",
@@ -338,11 +361,13 @@ Principal = Annotated[
 
 
 # ============================================================
-# General helper functions
+# Helpers
 # ============================================================
 
 def current_time() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
 def canonical_json(value: Any) -> str:
@@ -360,12 +385,20 @@ def hash_text(value: str) -> str:
     ).hexdigest()
 
 
-def hash_message(message: dict[str, Any]) -> str:
-    return hash_text(canonical_json(message))
+def hash_message(
+    message: dict[str, Any],
+) -> str:
+    return hash_text(
+        canonical_json(message)
+    )
 
 
-def hash_package(package: dict[str, Any]) -> str:
-    return hash_text(canonical_json(package))
+def hash_package(
+    package: dict[str, Any],
+) -> str:
+    return hash_text(
+        canonical_json(package)
+    )
 
 
 def a2a_response(
@@ -409,7 +442,10 @@ def get_data_part(
     message: dict[str, Any],
     media_type: str,
 ) -> dict[str, Any]:
-    parts = message.get("parts", [])
+    parts = message.get(
+        "parts",
+        [],
+    )
 
     if not isinstance(parts, list):
         raise HTTPException(
@@ -421,17 +457,47 @@ def get_data_part(
         if not isinstance(part, dict):
             continue
 
-        if part.get("mediaType") != media_type:
-            continue
+        declared_type = part.get(
+            "mediaType"
+        )
 
         data = part.get("data")
 
-        if isinstance(data, dict):
+        if not isinstance(data, dict):
+            continue
+
+        if declared_type not in {
+            None,
+            media_type,
+            JSON_MEDIA_TYPE,
+        }:
+            continue
+
+        if isinstance(
+            data.get("packages"),
+            list,
+        ):
             return data
+
+        for key in (
+            "batch",
+            "invoiceClaimBatch",
+            "invoice_claim_batch",
+            "payload",
+            "data",
+        ):
+            nested = data.get(key)
+
+            if isinstance(nested, dict):
+                if isinstance(
+                    nested.get("packages"),
+                    list,
+                ):
+                    return nested
 
     raise HTTPException(
         status_code=400,
-        detail=f"Missing part: {media_type}",
+        detail="Invoice batch data is required",
     )
 
 
@@ -439,16 +505,22 @@ def validate_evidence_references(
     proposal: dict[str, Any],
     package: dict[str, Any],
 ) -> None:
-    evidence_refs = proposal.get("evidenceRefs")
+    evidence_refs = proposal.get(
+        "evidenceRefs"
+    )
 
-    if not isinstance(evidence_refs, list):
+    if not isinstance(
+        evidence_refs,
+        list,
+    ):
         raise ValueError(
             "evidenceRefs must be a list"
         )
 
     if len(evidence_refs) != 3:
         raise ValueError(
-            "evidenceRefs must contain exactly three references"
+            "evidenceRefs must contain exactly "
+            "three references"
         )
 
     if len(set(evidence_refs)) != 3:
@@ -461,13 +533,14 @@ def validate_evidence_references(
     for reference in evidence_refs:
         if not isinstance(reference, str):
             raise ValueError(
-                "Every evidence reference must be a string"
+                "Every evidence reference must "
+                "be a string"
             )
 
         if reference not in package_text:
             raise ValueError(
-                f"Evidence reference is not present in package: "
-                f"{reference}"
+                "Evidence reference is not present "
+                f"in package: {reference}"
             )
 
 
@@ -494,7 +567,8 @@ def validate_proposal(
 
     if missing_fields:
         raise ValueError(
-            f"Missing fields: {sorted(missing_fields)}"
+            f"Missing fields: "
+            f"{sorted(missing_fields)}"
         )
 
     package_id = proposal["packageId"]
@@ -578,14 +652,18 @@ def validate_proposal(
 
     evidence_refs = proposal["evidenceRefs"]
 
-    if not isinstance(evidence_refs, list):
+    if not isinstance(
+        evidence_refs,
+        list,
+    ):
         raise ValueError(
             "evidenceRefs must be a list"
         )
 
     if len(evidence_refs) != 3:
         raise ValueError(
-            "evidenceRefs must contain exactly three references"
+            "evidenceRefs must contain exactly "
+            "three references"
         )
 
     if len(set(evidence_refs)) != 3:
@@ -602,7 +680,8 @@ def validate_proposal(
 
     if not 60 <= len(rationale) <= 1500:
         raise ValueError(
-            "rationale must contain 60 to 1500 characters"
+            "rationale must contain 60 to "
+            "1500 characters"
         )
 
     if action not in rationale:
@@ -612,7 +691,7 @@ def validate_proposal(
 
 
 # ============================================================
-# LLM structured output schema
+# LLM schema
 # ============================================================
 
 INVOICE_DECISION_SCHEMA: dict[str, Any] = {
@@ -689,7 +768,14 @@ INVOICE_DECISION_SCHEMA: dict[str, Any] = {
 def llm_decision(
     package: dict[str, Any],
 ) -> dict[str, Any]:
-    package_id = package.get("packageId")
+    if llm_client is None:
+        raise RuntimeError(
+            "LLM client is unavailable"
+        )
+
+    package_id = package.get(
+        "packageId"
+    )
 
     if not isinstance(package_id, str):
         raise ValueError(
@@ -783,14 +869,18 @@ def decide_package(
                 "Cached proposal is invalid"
             )
 
-        package_id = package.get("packageId")
+        package_id = package.get(
+            "packageId"
+        )
 
         if not isinstance(package_id, str):
             raise ValueError(
                 "Package ID must be a string"
             )
 
-        proposal["actionId"] = str(uuid.uuid4())
+        proposal["actionId"] = str(
+            uuid.uuid4()
+        )
 
         validate_proposal(
             proposal,
@@ -828,8 +918,13 @@ def build_proposals(
     batch: dict[str, Any],
     db: Session,
 ) -> dict[str, Any]:
-    batch_id = batch.get("batchId")
-    packages = batch.get("packages")
+    batch_id = batch.get(
+        "batchId"
+    )
+
+    packages = batch.get(
+        "packages"
+    )
 
     if not isinstance(batch_id, str) or not batch_id:
         raise HTTPException(
@@ -843,7 +938,10 @@ def build_proposals(
             detail="Invalid packages",
         )
 
-    proposals: list[dict[str, Any]] = []
+    proposals: list[
+        dict[str, Any]
+    ] = []
+
     package_ids: set[str] = set()
     action_ids: set[str] = set()
 
@@ -854,7 +952,9 @@ def build_proposals(
                 detail="Each package must be an object",
             )
 
-        package_id = package.get("packageId")
+        package_id = package.get(
+            "packageId"
+        )
 
         if not isinstance(package_id, str):
             raise HTTPException(
@@ -938,39 +1038,70 @@ def build_proposals(
 @app.get("/.well-known/agent-card.json")
 def agent_card() -> dict[str, Any]:
     return {
+        "protocolVersion": "1.0",
         "name": "Invoice Action Agent",
         "description": (
             "Proposes evidence-based invoice actions "
             "and executes accepted actions safely."
         ),
         "version": "1.0.0",
-        "capabilities": {},
-        "supportedInterfaces": [
-            {
-                "url": BASE_URL,
-                "protocolBinding": "HTTP+JSON",
-                "protocolVersion": "1.0",
-            }
-        ],
+        "url": BASE_URL,
+        "preferredTransport": "JSONRPC",
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": True,
+            "extendedAgentCard": False,
+        },
         "defaultInputModes": [
+            JSON_MEDIA_TYPE,
+            A2A_MEDIA_TYPE,
             BATCH_MEDIA_TYPE,
         ],
         "defaultOutputModes": [
+            A2A_MEDIA_TYPE,
             PROPOSAL_MEDIA_TYPE,
             RECEIPT_MEDIA_TYPE,
+        ],
+        "securitySchemes": {
+            "bearerAuth": {
+                "httpAuthSecurityScheme": {
+                    "scheme": "bearer",
+                    "bearerFormat": "Bearer",
+                }
+            }
+        },
+        "securityRequirements": [
+            {
+                "schemes": {
+                    "bearerAuth": {
+                        "list": [],
+                    }
+                }
+            }
         ],
         "skills": [
             {
                 "id": "invoice_action_agent",
                 "name": "Invoice action agent",
                 "description": (
-                    "Reads invoice evidence and "
-                    "proposes safe actions."
+                    "Reads invoice evidence and proposes "
+                    "safe actions."
                 ),
                 "tags": [
                     "invoice",
                     "payments",
                     "approval",
+                ],
+                "inputModes": [
+                    JSON_MEDIA_TYPE,
+                    A2A_MEDIA_TYPE,
+                    BATCH_MEDIA_TYPE,
+                ],
+                "outputModes": [
+                    A2A_MEDIA_TYPE,
+                    PROPOSAL_MEDIA_TYPE,
+                    RECEIPT_MEDIA_TYPE,
                 ],
             }
         ],
@@ -981,13 +1112,19 @@ def agent_card() -> dict[str, Any]:
 # Message endpoint
 # ============================================================
 
-@app.post("/a2a/message:send")
-async def send_message(
+async def handle_send_message(
     request: Request,
     principal: Principal,
     db: DatabaseSession,
 ) -> JSONResponse:
-    payload = await request.json()
+    try:
+        payload = await request.json()
+
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON",
+        )
 
     if not isinstance(payload, dict):
         raise HTTPException(
@@ -995,15 +1132,29 @@ async def send_message(
             detail="Request body must be an object",
         )
 
-    message = payload.get("message")
+    params = payload.get(
+        "params"
+    )
+
+    if isinstance(params, dict):
+        message = params.get(
+            "message"
+        )
+
+    else:
+        message = payload.get(
+            "message"
+        )
 
     if not isinstance(message, dict):
         raise HTTPException(
             status_code=400,
-            detail="Missing message",
+            detail="Missing params.message",
         )
 
-    message_id = message.get("messageId")
+    message_id = message.get(
+        "messageId"
+    )
 
     if not isinstance(message_id, str):
         raise HTTPException(
@@ -1017,11 +1168,21 @@ async def send_message(
             detail="messageId cannot be empty",
         )
 
-    if message.get("role") != "ROLE_USER":
+    role = message.get(
+        "role",
+        "ROLE_USER",
+    )
+
+    if role == "user":
+        role = "ROLE_USER"
+
+    if role != "ROLE_USER":
         raise HTTPException(
             status_code=400,
             detail="role must be ROLE_USER",
         )
+
+    message["role"] = "ROLE_USER"
 
     incoming_hash = hash_message(message)
 
@@ -1074,7 +1235,10 @@ async def send_message(
             }
         )
 
-    parts = message.get("parts", [])
+    parts = message.get(
+        "parts",
+        [],
+    )
 
     if not isinstance(parts, list):
         raise HTTPException(
@@ -1088,7 +1252,18 @@ async def send_message(
         if isinstance(part, dict)
     }
 
-    if BATCH_MEDIA_TYPE in media_types:
+    if (
+        BATCH_MEDIA_TYPE in media_types
+        or JSON_MEDIA_TYPE in media_types
+        or any(
+            isinstance(part, dict)
+            and isinstance(
+                part.get("data"),
+                dict,
+            )
+            for part in parts
+        )
+    ):
         batch = get_data_part(
             message,
             BATCH_MEDIA_TYPE,
@@ -1174,8 +1349,13 @@ def process_result_continuation(
     incoming_hash: str,
     db: Session,
 ) -> JSONResponse:
-    task_id = message.get("taskId")
-    context_id = message.get("contextId")
+    task_id = message.get(
+        "taskId"
+    )
+
+    context_id = message.get(
+        "contextId"
+    )
 
     if not isinstance(task_id, str):
         raise HTTPException(
@@ -1259,17 +1439,27 @@ def process_result_continuation(
                 detail="Proposal artifact unavailable",
             )
 
-        proposal_parts = proposal_artifacts[0]["parts"]
-        proposal_data = proposal_parts[0]["data"]
+        proposal_parts = proposal_artifacts[0][
+            "parts"
+        ]
 
-        if not isinstance(proposal_data, dict):
+        proposal_data = proposal_parts[0][
+            "data"
+        ]
+
+        if not isinstance(
+            proposal_data,
+            dict,
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Proposal data is invalid",
             )
 
-        if result_data.get("batchId") != (
-            proposal_data.get("batchId")
+        if result_data.get(
+            "batchId"
+        ) != proposal_data.get(
+            "batchId"
         ):
             raise HTTPException(
                 status_code=400,
@@ -1280,7 +1470,10 @@ def process_result_continuation(
             "proposals"
         )
 
-        if not isinstance(stored_proposals, list):
+        if not isinstance(
+            stored_proposals,
+            list,
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Stored proposals are invalid",
@@ -1337,15 +1530,23 @@ def process_result_continuation(
                     detail="Invalid stored action",
                 )
 
-            proposal_key: tuple[str, str, str] = (
+            proposal_key: tuple[
+                str,
+                str,
+                str,
+            ] = (
                 proposal_package_id,
                 proposal_action_id,
                 proposal_action,
             )
 
-            proposals_by_key[proposal_key] = proposal
+            proposals_by_key[
+                proposal_key
+            ] = proposal
 
-        results = result_data.get("results")
+        results = result_data.get(
+            "results"
+        )
 
         if not isinstance(results, list):
             raise HTTPException(
@@ -1353,7 +1554,9 @@ def process_result_continuation(
                 detail="results must be a list",
             )
 
-        executions: list[dict[str, Any]] = []
+        executions: list[
+            dict[str, Any]
+        ] = []
 
         for result in results:
             if not isinstance(result, dict):
@@ -1380,7 +1583,9 @@ def process_result_continuation(
             ):
                 raise HTTPException(
                     status_code=400,
-                    detail="Result packageId must be a string",
+                    detail=(
+                        "Result packageId must be a string"
+                    ),
                 )
 
             if not isinstance(
@@ -1389,7 +1594,9 @@ def process_result_continuation(
             ):
                 raise HTTPException(
                     status_code=400,
-                    detail="Result actionId must be a string",
+                    detail=(
+                        "Result actionId must be a string"
+                    ),
                 )
 
             if not isinstance(
@@ -1398,10 +1605,16 @@ def process_result_continuation(
             ):
                 raise HTTPException(
                     status_code=400,
-                    detail="Result action must be a string",
+                    detail=(
+                        "Result action must be a string"
+                    ),
                 )
 
-            result_key: tuple[str, str, str] = (
+            result_key: tuple[
+                str,
+                str,
+                str,
+            ] = (
                 result_package_id,
                 result_action_id,
                 result_action,
@@ -1410,10 +1623,14 @@ def process_result_continuation(
             if result_key not in proposals_by_key:
                 raise HTTPException(
                     status_code=400,
-                    detail="Result does not match proposal",
+                    detail=(
+                        "Result does not match proposal"
+                    ),
                 )
 
-            outcome = result.get("outcome")
+            outcome = result.get(
+                "outcome"
+            )
 
             if outcome not in {
                 "ACCEPTED",
@@ -1437,18 +1654,22 @@ def process_result_continuation(
             ):
                 raise HTTPException(
                     status_code=400,
-                    detail="receiptNonce must be a string",
+                    detail=(
+                        "receiptNonce must be a string"
+                    ),
                 )
 
             if not receipt_nonce:
                 raise HTTPException(
                     status_code=400,
-                    detail="receiptNonce cannot be empty",
+                    detail=(
+                        "receiptNonce cannot be empty"
+                    ),
                 )
 
-            original_proposal = (
-                proposals_by_key[result_key]
-            )
+            original_proposal = proposals_by_key[
+                result_key
+            ]
 
             executions.append(
                 {
@@ -1492,7 +1713,10 @@ def process_result_continuation(
             [],
         )
 
-        if not isinstance(task_history, list):
+        if not isinstance(
+            task_history,
+            list,
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Task history is invalid",
@@ -1503,7 +1727,10 @@ def process_result_continuation(
             [],
         )
 
-        if not isinstance(task_artifacts, list):
+        if not isinstance(
+            task_artifacts,
+            list,
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Task artifacts are invalid",
@@ -1541,6 +1768,49 @@ def process_result_continuation(
 
 
 # ============================================================
+# Message routes
+# ============================================================
+
+@app.post("/message:send")
+async def send_message_root(
+    request: Request,
+    principal: Principal,
+    db: DatabaseSession,
+) -> JSONResponse:
+    return await handle_send_message(
+        request=request,
+        principal=principal,
+        db=db,
+    )
+
+
+@app.post("/message%3Asend")
+async def send_message_encoded(
+    request: Request,
+    principal: Principal,
+    db: DatabaseSession,
+) -> JSONResponse:
+    return await handle_send_message(
+        request=request,
+        principal=principal,
+        db=db,
+    )
+
+
+@app.post("/a2a/message:send")
+async def send_message(
+    request: Request,
+    principal: Principal,
+    db: DatabaseSession,
+) -> JSONResponse:
+    return await handle_send_message(
+        request=request,
+        principal=principal,
+        db=db,
+    )
+
+
+# ============================================================
 # Task routes
 # ============================================================
 
@@ -1557,7 +1827,9 @@ def list_tasks(
         .all()
     )
 
-    tasks: list[dict[str, Any]] = []
+    tasks: list[
+        dict[str, Any]
+    ] = []
 
     for record in records:
         stored_task_json: str = record.task_json
@@ -1645,3 +1917,52 @@ def cancel_task(
         db.commit()
 
         return a2a_response(task)
+
+
+# ============================================================
+# Health
+# ============================================================
+
+@app.get("/")
+def health() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "service": "invoice-action-agent",
+    }
+
+
+# ============================================================
+# Error handling
+# ============================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(
+    request: Request,
+    exc: HTTPException,
+) -> JSONResponse:
+    return JSONResponse(
+        content={
+            "error": exc.detail,
+        },
+        status_code=exc.status_code,
+        headers=exc.headers or {},
+        media_type=A2A_MEDIA_TYPE,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return a2a_response(
+        {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+            },
+        },
+        status_code=500,
+    )
